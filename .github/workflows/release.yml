@@ -1,0 +1,326 @@
+name: Release new Docker image
+
+# Single pipeline for the plone/nick images. There are no git tags: what is on
+# main is what is released, and the diff of a change says which images it
+# affects (see scripts/changed-releases.sh).
+#
+# Trigger matrix:
+#   * pull request   -> lint, and build and smoke-test the affected releases;
+#                       the registry is never touched
+#   * push to main   -> same, then publish the affected releases
+#   * manual run     -> same, for the version given, like after a failed run:
+#                       the next push does not pick up what this one missed
+#
+# Which of the moving tags a release gets comes from scripts/release-info.sh;
+# `latest` only goes to the version in version.txt.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to rebuild and publish, like 3.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Never cancel a run on main: the next push only sees its own diff, so the
+# releases of the cancelled run would not be published.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: plone/nick
+  # add for example "-buildtest" to not overwrite baseline images
+  SUFFIX: ""
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      versions: ${{ steps.vars.outputs.versions }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # The diff needs the base commit
+          fetch-depth: 0
+
+      - name: Resolve the affected releases
+        id: vars
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            workflow_dispatch)
+              # Fails on a version without a release folder
+              sh scripts/release-info.sh "${INPUT_VERSION}" > /dev/null
+              versions="${INPUT_VERSION}"
+              ;;
+            pull_request)
+              versions=$(sh scripts/changed-releases.sh --tooling "${PR_BASE}" "${GITHUB_SHA}")
+              ;;
+            *)
+              versions=$(sh scripts/changed-releases.sh "${PUSH_BASE}" "${GITHUB_SHA}")
+              ;;
+          esac
+          echo "Affected releases: ${versions:-none}"
+          echo "versions=$(jq -Rcs 'split("\n") | map(select(length > 0))' <<< "${versions}")" >> "${GITHUB_OUTPUT}"
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: make lint
+        run: make lint
+
+  # Builds each affected release for amd64 and runs it against PostgreSQL: it
+  # has to migrate, install the default profile and report healthy.
+  test:
+    needs:
+      - meta
+    if: needs.meta.outputs.versions != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.meta.outputs.versions) }}
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: nick
+          POSTGRES_PASSWORD: nick
+          POSTGRES_DB: nick
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Find the series
+        id: series
+        env:
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          sh scripts/release-info.sh "${VERSION}" | grep '^series=' >> "${GITHUB_OUTPUT}"
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ steps.series.outputs.series }}/Dockerfile
+          build-args: NICK_VERSION=${{ matrix.version }}
+          tags: ${{ env.IMAGE }}:test
+          load: true
+
+      - name: Run image
+        run: |
+          set -euo pipefail
+          docker run -d --name nick --network "${{ job.services.postgres.network }}" \
+            -e DB_HOST=postgres -e DB_PASSWORD=nick -e SECRET=test \
+            "${IMAGE}:test"
+          for _ in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' nick)
+            running=$(docker inspect -f '{{.State.Running}}' nick)
+            echo "health=${status} running=${running}"
+            [ "${status}" = "healthy" ] && break
+            [ "${running}" = "false" ] && break
+            sleep 5
+          done
+          docker logs nick
+          test "${status}" = "healthy"
+
+  build:
+    needs:
+      - meta
+      - lint
+      - test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.meta.outputs.versions != '[]'
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.meta.outputs.versions) }}
+        platform:
+          - runner: ubuntu-24.04
+            arch: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Prepare the series and the artifact key
+        id: series
+        env:
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          platform=${{ matrix.platform.arch }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "${GITHUB_ENV}"
+          sh scripts/release-info.sh "${VERSION}" | grep '^series=' >> "${GITHUB_OUTPUT}"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+            suffix=${{ env.SUFFIX }}
+          tags: type=raw,value=${{ matrix.version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Registry
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pushed by digest only. The tags are applied once, to the manifest list,
+      # by the merge job below; a per-platform build that pushed tags would have
+      # the two architectures overwrite each other.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          platforms: ${{ matrix.platform.arch }}
+          context: .
+          file: ${{ steps.series.outputs.series }}/Dockerfile
+          build-args: NICK_VERSION=${{ matrix.version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true,name=${{ env.IMAGE }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "${digest}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          ls -la "${{ runner.temp }}/digests"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.version }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  merge:
+    needs:
+      - meta
+      - build
+    if: needs.meta.outputs.versions != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.meta.outputs.versions) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve the tag rules
+        id: vars
+        env:
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          info=$(sh scripts/release-info.sh "${VERSION}")
+          echo "${info}"
+          field() { sed -n "s/^$1=//p" <<< "${info}"; }
+          {
+            echo 'tag-rules<<__RULES__'
+            echo "type=semver,pattern={{version}},value=${VERSION}"
+            echo "type=semver,pattern={{major}}.{{minor}},value=${VERSION},enable=$(field is-newest-of-series)"
+            echo "type=semver,pattern={{major}},value=${VERSION},enable=$(field is-newest-of-major)"
+            echo "type=raw,value=latest,enable=$(field is-latest)"
+            echo '__RULES__'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.version }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Registry
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+            suffix=${{ env.SUFFIX }}
+          tags: ${{ steps.vars.outputs.tag-rules }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          ls -la
+          # shellcheck disable=SC2046  # word splitting is exactly what is wanted
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "${META_JSON}") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+
+  # Syncs the Docker Hub description from the root README, so the Hub page
+  # cannot drift from what this repository actually publishes. Main only: the
+  # README on main is the source of truth. It does not wait for a release, as a
+  # change to the README alone publishes no image.
+  description:
+    needs:
+      - lint
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Update repo description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: plone/nick
+          short-description: ${{ github.event.repository.description }}
+          # The README links to paths in this repository relative to its root.
+          # On Docker Hub those would resolve against hub.docker.com and 404,
+          # so let the action rewrite them to absolute GitHub URLs.
+          enable-url-completion: true
+          readme-filepath: ./README.md

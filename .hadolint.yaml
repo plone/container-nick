@@ -1,0 +1,14 @@
+# hadolint configuration for `make lint`.
+#
+# Every rule below is silenced deliberately. Anything not listed here is a real
+# finding and should be fixed in the Dockerfile rather than added to this list.
+ignored:
+  # Non-numeric user-id. `USER node` is the user the official node image ships
+  # and the owner of /app and of the pnpm store; naming it is correct.
+  - DL3066
+
+  # Pin versions in npm install. corepack is installed at its latest version on
+  # purpose, like in the official node image guidance: it only fetches the pnpm
+  # version that package.json pins, and an old corepack fails on new registry
+  # signing keys.
+  - DL3016

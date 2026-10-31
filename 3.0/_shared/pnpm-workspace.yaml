@@ -1,0 +1,20 @@
+# Add-ons that images built FROM this one copy in, like a project's
+# backend/packages/<add-on>, are workspace packages
+packages:
+  - 'packages/*'
+
+allowBuilds:
+  bcrypt: true
+  esbuild: true
+  sharp: true
+
+# The entrypoint runs `node --import tsx` from /app. tsx is a dependency of
+# @plone/nick, not of this project, so hoist it to /app/node_modules: Nick then
+# always runs on the tsx version it was released with.
+publicHoistPattern:
+  - tsx
+
+# A Nick release is built here as soon as it is tagged, so it cannot wait out
+# pnpm's minimum release age.
+minimumReleaseAgeExclude:
+  - '@plone/*'

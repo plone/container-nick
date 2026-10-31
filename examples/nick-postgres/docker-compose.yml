@@ -1,0 +1,57 @@
+services:
+  # Migrates the database and installs the profiles, then exits
+  migrate:
+    image: plone/nick:latest
+    command: --modules=migrate
+    environment: &nick-environment
+      DB_HOST: db
+      DB_USER: nick
+      DB_PASSWORD: nick
+      DB_NAME: nick
+      SECRET: change-me
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    image: plone/nick:latest
+    environment:
+      <<: *nick-environment
+      NICK_MODULES: api
+      ALLOWED_ORIGINS: http://localhost:3000
+    ports:
+      - "8080:8080"
+    volumes:
+      - blobs:/app/var/blobstorage
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: plone/nick:latest
+    environment:
+      <<: *nick-environment
+      NICK_MODULES: worker
+    volumes:
+      - blobs:/app/var/blobstorage
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: nick
+      POSTGRES_PASSWORD: nick
+      POSTGRES_DB: nick
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "nick", "-d", "nick"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - data:/var/lib/postgresql
+
+volumes:
+  blobs: {}
+  data: {}
